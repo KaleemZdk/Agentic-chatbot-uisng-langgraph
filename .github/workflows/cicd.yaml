@@ -1,0 +1,288 @@
+name: Streamlit AWS CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "README.md"
+
+  # Allows you to run the workflow manually
+  workflow_dispatch:
+
+# Prevent two deployments from running at the same time
+concurrency:
+  group: agentic-chatbot-production
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # 1. CONTINUOUS INTEGRATION
+  # ============================================================
+  integration:
+    name: Continuous Integration
+    runs-on: ubuntu-latest
+
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest
+
+      - name: Lint code
+        run: ruff check . --exit-zero
+        # --exit-zero: lint issues are reported but won't fail the build yet.
+        # Drop that flag once you want lint failures to block merges.
+
+      - name: Compile-check all Python files
+        run: python -m compileall -q .
+
+      - name: Import sanity check
+        run: python -c "import chatbot; print('chatbot.py imported OK')"
+
+      - name: Run unit tests
+        run: |
+          if [ -d "tests" ] || compgen -G "test_*.py" > /dev/null || compgen -G "*_test.py" > /dev/null; then
+            pytest -v
+          else
+            echo "No tests found — skipping pytest."
+          fi
+
+
+  # ============================================================
+  # 2. BUILD AND PUSH IMAGE TO DOCKER HUB
+  # ============================================================
+  push_to_registry:
+    name: Build and Push Docker Image
+    needs: integration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Docker image settings
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
+        run: |
+          if [ -z "$DOCKER_USERNAME" ]; then
+            echo "DOCKER_USERNAME secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$IMAGE_NAME" ]; then
+            echo "IMAGE_NAME secret is missing."
+            exit 1
+          fi
+
+          echo "Docker image settings are configured."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ secrets.IMAGE_NAME }}:main
+            ${{ secrets.DOCKER_USERNAME }}/${{ secrets.IMAGE_NAME }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+  # ============================================================
+  # 3. DEPLOY TO AWS EC2 SELF-HOSTED RUNNER
+  # ============================================================
+  continuous_deployment:
+    name: Deploy to AWS EC2
+    needs: push_to_registry
+    runs-on: self-hosted
+
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Validate application secrets
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          if [ -z "$GROQ_API_KEY" ]; then
+            echo "GROQ_API_KEY secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "GEMINI_API_KEY secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$TAVILY_API_KEY" ]; then
+            echo "TAVILY_API_KEY secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$SMTP_EMAIL" ]; then
+            echo "SMTP_EMAIL secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$SMTP_PASSWORD" ]; then
+            echo "SMTP_PASSWORD secret is missing."
+            exit 1
+          fi
+
+          echo "All required application secrets are configured."
+
+      - name: Check optional LangSmith tracing secrets
+        env:
+          LANGSMITH_TRACING: ${{ secrets.LANGSMITH_TRACING }}
+          LANGSMITH_ENDPOINT: ${{ secrets.LANGSMITH_ENDPOINT }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: ${{ secrets.LANGSMITH_PROJECT }}
+        run: |
+          # LangChain picks these up straight from the environment to enable
+          # tracing automatically — no app code depends on them, so a
+          # missing one only disables tracing, it doesn't fail the deploy.
+          if [ -z "$LANGSMITH_TRACING" ]; then
+            echo "::warning::LANGSMITH_TRACING secret is not set — tracing will be disabled."
+          fi
+
+          if [ -z "$LANGSMITH_ENDPOINT" ]; then
+            echo "::warning::LANGSMITH_ENDPOINT secret is not set — tracing will be disabled."
+          fi
+
+          if [ -z "$LANGSMITH_API_KEY" ]; then
+            echo "::warning::LANGSMITH_API_KEY secret is not set — tracing will be disabled."
+          fi
+
+          if [ -z "$LANGSMITH_PROJECT" ]; then
+            echo "::warning::LANGSMITH_PROJECT secret is not set — tracing will be disabled."
+          fi
+
+      - name: Pull latest Docker image
+        env:
+          IMAGE_PATH: ${{ secrets.DOCKER_USERNAME }}/${{ secrets.IMAGE_NAME }}
+        run: |
+          docker pull "${IMAGE_PATH}:main"
+
+      - name: Stop and remove existing container
+        run: |
+          docker rm -f stapp 2>/dev/null || true
+
+      - name: Run Streamlit container
+        env:
+          IMAGE_PATH: ${{ secrets.DOCKER_USERNAME }}/${{ secrets.IMAGE_NAME }}
+
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+
+          LANGSMITH_TRACING: ${{ secrets.LANGSMITH_TRACING }}
+          LANGSMITH_ENDPOINT: ${{ secrets.LANGSMITH_ENDPOINT }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: ${{ secrets.LANGSMITH_PROJECT }}
+
+        run: |
+          docker run -d \
+            --restart unless-stopped \
+            --name stapp \
+            -p 8501:8501 \
+            -v chatbot_data:/app/data \
+            -e GROQ_API_KEY \
+            -e GEMINI_API_KEY \
+            -e TAVILY_API_KEY \
+            -e SMTP_EMAIL \
+            -e SMTP_PASSWORD \
+            -e LANGSMITH_TRACING \
+            -e LANGSMITH_ENDPOINT \
+            -e LANGSMITH_API_KEY \
+            -e LANGSMITH_PROJECT \
+            "${IMAGE_PATH}:main"
+          # -v chatbot_data:/app/data persists the sqlite checkpoint db and
+          # FAISS index across redeploys — Docker creates the named volume
+          # automatically on first run if it doesn't exist yet.
+
+      - name: Verify container is running
+        run: |
+          sleep 10
+
+          if ! docker ps \
+            --filter "name=^stapp$" \
+            --filter "status=running" \
+            --format "{{.Names}}" | grep -q "^stapp$"; then
+
+            echo "The Streamlit container failed to start."
+            docker logs stapp || true
+            exit 1
+          fi
+
+          echo "The Streamlit container is running."
+          docker ps --filter "name=^stapp$"
+
+      - name: Verify Streamlit health endpoint
+        run: |
+          for attempt in $(seq 1 12); do
+            if docker exec stapp python -c \
+              "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=5)" \
+              >/dev/null 2>&1; then
+
+              echo "Streamlit application is healthy."
+              exit 0
+            fi
+
+            echo "Waiting for Streamlit to become ready..."
+            sleep 5
+          done
+
+          echo "Streamlit did not become healthy."
+          docker logs --tail 100 stapp || true
+          exit 1
+
+      - name: Show recent application logs
+        if: always()
+        run: |
+          docker logs --tail 50 stapp 2>/dev/null || true
+
+      - name: Remove unused Docker images
+        if: always()
+        run: |
+          docker image prune -f
