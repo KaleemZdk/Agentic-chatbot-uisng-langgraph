@@ -58,7 +58,7 @@ jobs:
         run: python -m compileall -q .
 
       - name: Import sanity check
-        run: python -c "import chatbot; print('chatbot.py imported OK')"
+        run: python -c "import backend; print('backend.py imported OK')"
 
       - name: Run unit tests
         run: |
